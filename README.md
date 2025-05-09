@@ -100,6 +100,90 @@ rnnt-{epoch:02d}-{val_loss:.2f}.ckpt
 
 The best models are kept based on validation loss.
 
+# Complete Implementation with Accelerate for Kaggle Multi-GPU
+
+I'll create three complete files that work together:
+
+1. **models/streaming_rnnt.py** - The model definition
+2. **train_accelerate.py** - Main training script with Accelerate
+3. **run_accelerate.py** - Command-line runner script
+
+Let's start with the model:
+
+Now, let's create the training script with Accelerate:
+
+Finally, let's create the run script to simplify launching the training:
+
+## How to Use This Implementation
+
+I've created three complete files that replace PyTorch Lightning with Accelerate for better Kaggle multi-GPU support:
+
+### 1. models/streaming_rnnt.py
+
+This file contains the model definition, converted from PyTorch Lightning to a standard nn.Module.
+
+### 2. train.py
+
+The main training script using Accelerate. It handles:
+
+-   Dataloaders and datasets
+-   Model creation and training
+-   Checkpointing and logging
+-   Validation
+
+### 3. run.py
+
+A command-line runner script that:
+
+-   Parses arguments
+-   Sets up directories
+-   Launches training with Accelerate
+
+### Getting Started
+
+1. **Install Accelerate**:
+
+```bash
+pip install accelerate
+```
+
+2. **Run Basic Training**:
+
+```bash
+python run.py \
+  --train_manifest=/path/to/train.json \
+  --val_manifest=/path/to/val.json \
+  --tokenizer_model_path=/path/to/tokenizer.model \
+  --bg_noise_path=/path/to/noise \
+  --batch_size=32 \
+  --output_dir=./my_experiment
+```
+
+3. **Resume Training**:
+
+```bash
+python run.py \
+  --train_manifest=/path/to/train.json \
+  --val_manifest=/path/to/val.json \
+  --tokenizer_model_path=/path/to/tokenizer.model \
+  --resume_from_checkpoint=./my_experiment/rnnt-latest.pt
+```
+
+4. **Advanced Configuration**:
+
+```bash
+python run.py \
+  --train_manifest=/path/to/train.json \
+  --val_manifest=/path/to/val.json \
+  --tokenizer_model_path=/path/to/tokenizer.model \
+  --batch_size=64 \
+  --lr=3e-4 \
+  --max_epochs=100 \
+  --precision=bf16-mixed \
+  --num_workers=16 \
+  --experiment_name=large_batch
+```
+
 ## License
 
 [Your license information here]

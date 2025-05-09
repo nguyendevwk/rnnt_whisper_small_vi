@@ -76,7 +76,7 @@ def main():
     # Build the accelerate launch command
     cmd = [
         "accelerate", "launch",
-        "train.py",
+        "train_accelerate.py",
         f"--batch_size={args.batch_size}",
         f"--max_epochs={args.max_epochs}",
         f"--lr={args.lr}",
