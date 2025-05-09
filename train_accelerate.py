@@ -35,24 +35,39 @@ def train(args):
     logger.info(f"Mixed precision: {accelerator.mixed_precision}")
     logger.info(f"Number of processes: {accelerator.num_processes}")
     logger.info(f"Device: {accelerator.device}")
-    logger.info(f"Train manifest: {args.train_manifest}")
-    logger.info(f"Val manifest: {args.val_manifest}")
+
+    # Important: Convert train_manifest and val_manifest to lists if they're not already
+    train_manifest = [args.train_manifest] if isinstance(args.train_manifest, str) else args.train_manifest
+    val_manifest = [args.val_manifest] if isinstance(args.val_manifest, str) else args.val_manifest
+
+    logger.info(f"Train manifest: {train_manifest}")
+    logger.info(f"Val manifest: {val_manifest}")
+
+    # Verify manifest files exist
+    for manifest in train_manifest + val_manifest:
+        if not os.path.isfile(manifest):
+            logger.error(f"Manifest file does not exist or is not a file: {manifest}")
+            raise FileNotFoundError(f"Manifest file not found: {manifest}")
 
     # Create datasets and dataloaders
     try:
         train_dataset = AudioDataset(
-            manifest_files=args.train_manifest,
-            bg_noise_path=args.bg_noise_path if hasattr(args, 'bg_noise_path') else None,
+            manifest_files=train_manifest,
+            tokenizer_model_path=args.tokenizer_model_path,
+            bg_noise_path=args.bg_noise_path if hasattr(args, 'bg_noise_path') else [],
             shuffle=True,
-            augment=args.augment if hasattr(args, 'augment') else True,
-            tokenizer_model_path=args.tokenizer_model_path
+            augment=args.augment
         )
 
         val_dataset = AudioDataset(
-            manifest_files=args.val_manifest,
-            shuffle=False,
-            tokenizer_model_path=args.tokenizer_model_path
+            manifest_files=val_manifest,
+            tokenizer_model_path=args.tokenizer_model_path,
+            shuffle=False
         )
+
+        logger.info(f"Train dataset size: {len(train_dataset)}")
+        logger.info(f"Val dataset size: {len(val_dataset)}")
+
     except Exception as e:
         logger.error(f"Error creating datasets: {e}")
         raise
