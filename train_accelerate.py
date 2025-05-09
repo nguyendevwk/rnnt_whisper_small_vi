@@ -13,7 +13,7 @@ import glob
 from models.streaming_rnnt import StreamingRNNT
 from utils.dataset import AudioDataset, collate_fn
 from utils.scheduler import WarmupLR
-from constants import TOTAL_STEPS, WARMUP_STEPS, LR, MIN_LR
+from constants import TOTAL_STEPS, WARMUP_STEPS, LR, MIN_LR, SAMPLE_RATE, N_MELS
 
 # Set up logger
 logger = get_logger(__name__)
