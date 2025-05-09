@@ -12,7 +12,12 @@ from loguru import logger
 from models.streaming_rnnt import StreamingRNNT
 from utils.dataset import AudioDataset, collate_fn
 from utils.scheduler import WarmupLR
-from constants import *
+from constants import (
+    ATTENTION_CONTEXT_SIZE, VOCAB_SIZE, TOKENIZER_MODEL_PATH,
+    BATCH_SIZE, NUM_WORKERS, MAX_EPOCHS, MAX_SYMBOLS,
+    TOTAL_STEPS, WARMUP_STEPS, LR, MIN_LR,
+    LOG_DIR
+)
 
 def train(args):
     """
@@ -34,23 +39,59 @@ def train(args):
     logger.info(f"Number of processes: {accelerator.num_processes}")
     logger.info(f"Device: {accelerator.device}")
 
+    # Convert train_manifest and val_manifest to lists if they're strings
+    train_manifest = args.train_manifest
+    if isinstance(train_manifest, str):
+        train_manifest = [train_manifest]
+
+    val_manifest = args.val_manifest
+    if isinstance(val_manifest, str):
+        val_manifest = [val_manifest]
+
+    logger.info(f"Train manifest: {train_manifest}")
+    logger.info(f"Val manifest: {val_manifest}")
+
+    # Check if manifest files exist
+    for manifest_path in train_manifest + val_manifest:
+        if not os.path.exists(manifest_path):
+            logger.error(f"Manifest file not found: {manifest_path}")
+            if accelerator.is_main_process:
+                logger.error(f"Current directory: {os.getcwd()}")
+                logger.error(f"Directory contents: {os.listdir('.')}")
+                # Try to find the file in the working directory structure
+                for root, dirs, files in os.walk('.', topdown=True, followlinks=False):
+                    if any(f.endswith('.jsonl') for f in files):
+                        logger.error(f"Found .jsonl files in: {root}")
+                        logger.error(f"Files: {[f for f in files if f.endswith('.jsonl')]}")
+            raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+
+    # Handle bg_noise_path
+    bg_noise_path = args.bg_noise_path
+    if bg_noise_path and not isinstance(bg_noise_path, list):
+        bg_noise_path = [bg_noise_path]
+
     # Create datasets and dataloaders
-    train_dataset = AudioDataset(
-        manifest_files=args.train_manifest,
-        bg_noise_path=args.bg_noise_path,
-        shuffle=True,
-        augment=args.augment,
-        tokenizer_model_path=args.tokenizer_model_path
-    )
+    try:
+        train_dataset = AudioDataset(
+            manifest_files=train_manifest,
+            bg_noise_path=bg_noise_path,
+            shuffle=True,
+            augment=args.augment,
+            tokenizer_model_path=args.tokenizer_model_path
+        )
 
-    val_dataset = AudioDataset(
-        manifest_files=args.val_manifest,
-        shuffle=False,
-        tokenizer_model_path=args.tokenizer_model_path
-    )
+        val_dataset = AudioDataset(
+            manifest_files=val_manifest,
+            shuffle=False,
+            tokenizer_model_path=args.tokenizer_model_path
+        )
 
-    logger.info(f"Train dataset size: {len(train_dataset)}")
-    logger.info(f"Val dataset size: {len(val_dataset)}")
+        logger.info(f"Train dataset size: {len(train_dataset)}")
+        logger.info(f"Val dataset size: {len(val_dataset)}")
+
+    except Exception as e:
+        logger.error(f"Error creating datasets: {str(e)}")
+        raise
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -257,11 +298,11 @@ def get_args():
                         help="Minimum learning rate")
 
     # Data configuration
-    parser.add_argument("--train_manifest", default=TRAIN_MANIFEST,
+    parser.add_argument("--train_manifest", default="/kaggle/working/data/train/train_data.jsonl",
                         help="Path to training manifest file")
-    parser.add_argument("--val_manifest", default=VAL_MANIFEST,
+    parser.add_argument("--val_manifest", default="/kaggle/working/data/test/test_data.jsonl",
                         help="Path to validation manifest file")
-    parser.add_argument("--bg_noise_path", default=BG_NOISE_PATH,
+    parser.add_argument("--bg_noise_path", default="/kaggle/working/datatest/noise/fsdnoisy18k/",
                         help="Path to background noise for augmentation")
     parser.add_argument("--augment", action="store_true", default=True,
                         help="Apply data augmentation")
