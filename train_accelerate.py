@@ -20,78 +20,56 @@ from constants import (
 )
 
 def train(args):
-    """
-    Main training function with Accelerate
-    """
-    # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
-
-    # Initialize accelerator
     accelerator = Accelerator(
         mixed_precision=args.precision,
         log_with="tensorboard",
         project_dir=args.output_dir
     )
 
-    # Print training information
     logger.info(f"Distributed type: {accelerator.distributed_type}")
     logger.info(f"Mixed precision: {accelerator.mixed_precision}")
     logger.info(f"Number of processes: {accelerator.num_processes}")
     logger.info(f"Device: {accelerator.device}")
+    logger.info(f"Base path: {args.base_path}")
 
-    # Convert train_manifest and val_manifest to lists if they're strings
+    # Chỉ sử dụng train_manifest
     train_manifest = args.train_manifest
     if isinstance(train_manifest, str):
         train_manifest = [train_manifest]
 
-    val_manifest = args.val_manifest
-    if isinstance(val_manifest, str):
-        val_manifest = [val_manifest]
-
     logger.info(f"Train manifest: {train_manifest}")
-    logger.info(f"Val manifest: {val_manifest}")
 
-    # Check if manifest files exist
-    for manifest_path in train_manifest + val_manifest:
+    # Kiểm tra manifest
+    for manifest_path in train_manifest:
         if not os.path.exists(manifest_path):
             logger.error(f"Manifest file not found: {manifest_path}")
-            if accelerator.is_main_process:
-                logger.error(f"Current directory: {os.getcwd()}")
-                logger.error(f"Directory contents: {os.listdir('.')}")
-                # Try to find the file in the working directory structure
-                for root, dirs, files in os.walk('.', topdown=True, followlinks=False):
-                    if any(f.endswith('.jsonl') for f in files):
-                        logger.error(f"Found .jsonl files in: {root}")
-                        logger.error(f"Files: {[f for f in files if f.endswith('.jsonl')]}")
+            logger.error(f"Current directory: {os.getcwd()}")
+            logger.error(f"Directory contents: {os.listdir('.')}")
             raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
 
-    # Handle bg_noise_path
-    bg_noise_path = args.bg_noise_path
-    if bg_noise_path and not isinstance(bg_noise_path, list):
-        bg_noise_path = [bg_noise_path]
-
-    # Create datasets and dataloaders
+    # Tạo dataset
     try:
         train_dataset = AudioDataset(
             manifest_files=train_manifest,
-            bg_noise_path=bg_noise_path,
+            tokenizer_model_path=args.tokenizer_model_path,
+            base_path=args.base_path,  # Truyền base_path
+            bg_noise_path=None,  # Tắt background noise
             shuffle=True,
-            augment=args.augment,
-            tokenizer_model_path=args.tokenizer_model_path
+            augment=False  # Tắt augmentation
         )
-
-        val_dataset = AudioDataset(
-            manifest_files=val_manifest,
-            shuffle=False,
-            tokenizer_model_path=args.tokenizer_model_path
-        )
-
         logger.info(f"Train dataset size: {len(train_dataset)}")
-        logger.info(f"Val dataset size: {len(val_dataset)}")
-
     except Exception as e:
-        logger.error(f"Error creating datasets: {str(e)}")
+        logger.error(f"Error creating train dataset: {str(e)}")
         raise
+
+    # Kiểm tra thư mục âm thanh
+    audio_dir = os.path.join(args.base_path, "data/train/audio_files/")
+    if os.path.exists(audio_dir):
+        logger.info(f"Found {len(os.listdir(audio_dir))} audio files in {audio_dir}")
+    else:
+        logger.error(f"Audio directory not found: {audio_dir}")
+        raise FileNotFoundError(f"Audio directory not found: {audio_dir}")
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -103,174 +81,88 @@ def train(args):
         pin_memory=True
     )
 
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
-
-    # Create model
     model = StreamingRNNT(
         att_context_size=args.att_context_size,
         vocab_size=args.vocab_size,
         tokenizer_model_path=args.tokenizer_model_path
     )
 
-    # Create optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     scheduler = WarmupLR(optimizer, args.warmup_steps, args.total_steps, args.min_lr)
 
-    # Prepare all components with accelerator
-    model, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, scheduler
+    model, optimizer, train_dataloader, scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, scheduler
     )
 
-    # Initialize tracker for best validation loss
-    best_val_loss = float('inf')
+    global_step = 0
 
-    # Load checkpoint if provided
     if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
         accelerator.load_state(args.resume_from_checkpoint)
         logger.info(f"Loaded checkpoint from {args.resume_from_checkpoint}")
 
-    # Initialize tracker for steps
-    global_step = 0
-
-    # Training loop
+    # Vòng lặp huấn luyện (bỏ validation)
     for epoch in range(args.max_epochs):
         model.train()
         train_loss = 0.0
         start_time = time.time()
 
-        # Training
         for batch_idx, batch in enumerate(train_dataloader):
-            x, x_len, y, y_len = model.process_batch(batch)
+            try:
+                x, x_len, y, y_len = model.process_batch(batch)
+                loss = model(x, x_len, y, y_len)
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
 
-            # Forward pass
-            loss = model(x, x_len, y, y_len)
+                train_loss += loss.item()
+                global_step += 1
 
-            # Backward pass
-            accelerator.backward(loss)
+                # Log training metrics
+                if batch_idx % 100 == 0:
+                    lr = optimizer.param_groups[0]['lr']
+                    accelerator.log({
+                        "train_loss": loss.item(),
+                        "learning_rate": lr,
+                    }, step=global_step)
+                    logger.info(f"Epoch {epoch}, Step {global_step}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {lr:.8f}")
 
-            # Update parameters
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+                # Display predictions
+                if batch_idx != 0 and batch_idx % 2000 == 0:
+                    with torch.no_grad():
+                        model.eval()
+                        all_pred = model.greedy_decoding(x, x_len, max_symbols=MAX_SYMBOLS)
+                        all_true = []
+                        for i, y_i in enumerate(y):
+                            y_i = y_i.cpu().numpy().astype(int).tolist()
+                            y_i = y_i[:y_len[i]]
+                            all_true.append(model.tokenizer.decode_ids(y_i))
 
-            # Update loss
-            train_loss += loss.item()
-            global_step += 1
+                        all_pred = gather_object(all_pred, accelerator)
+                        all_true = gather_object(all_true, accelerator)
 
-            # Log training metrics (every 100 steps as in the original code)
-            if batch_idx % 100 == 0:
-                lr = optimizer.param_groups[0]['lr']
-                accelerator.log({
-                    "train_loss": loss.item(),
-                    "learning_rate": lr,
-                }, step=global_step)
+                        if accelerator.is_main_process:
+                            for pred, true in zip(all_pred[:2], all_true[:2]):
+                                logger.info(f"Pred: {pred}")
+                                logger.info(f"True: {true}")
+                            train_wer = wer(all_true, all_pred)
+                            accelerator.log({"train_wer": train_wer}, step=global_step)
+                            logger.info(f"Training WER: {train_wer:.4f}")
+                        model.train()
 
-                logger.info(f"Epoch {epoch}, Step {global_step}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {lr:.8f}")
+            except Exception as e:
+                logger.warning(f"Error processing batch {batch_idx}: {str(e)}. Skipping.")
+                continue
 
-            # Display predictions during training (every 2000 steps as in the original code)
-            if batch_idx != 0 and batch_idx % 2000 == 0:
-                with torch.no_grad():
-                    model.eval()
-                    all_pred = model.greedy_decoding(x, x_len, max_symbols=MAX_SYMBOLS)
-                    all_true = []
-                    for i, y_i in enumerate(y):
-                        y_i = y_i.cpu().numpy().astype(int).tolist()
-                        y_i = y_i[:y_len[i]]
-                        all_true.append(model.tokenizer.decode_ids(y_i))
-
-                    # Gather predictions from all processes
-                    all_pred = gather_object(all_pred, accelerator)
-                    all_true = gather_object(all_true, accelerator)
-
-                    if accelerator.is_main_process:
-                        for pred, true in zip(all_pred[:2], all_true[:2]):
-                            logger.info(f"Pred: {pred}")
-                            logger.info(f"True: {true}")
-
-                        train_wer = wer(all_true, all_pred)
-                        accelerator.log({"train_wer": train_wer}, step=global_step)
-                        logger.info(f"Training WER: {train_wer:.4f}")
-                    model.train()
-
-        # Only run validation every check_val_every_n_epoch epochs
-        if epoch % args.check_val_every_n_epoch == 0:
-            # Validation
-            model.eval()
-            val_loss = 0.0
-            all_val_pred = []
-            all_val_true = []
-
-            with torch.no_grad():
-                for batch_idx, batch in enumerate(val_dataloader):
-                    x, x_len, y, y_len = model.process_batch(batch)
-
-                    # Forward pass
-                    loss = model(x, x_len, y, y_len)
-                    val_loss += loss.item()
-
-                    # Decoding
-                    pred = model.greedy_decoding(x, x_len, max_symbols=MAX_SYMBOLS)
-                    true = []
-                    for i, y_i in enumerate(y):
-                        y_i = y_i.cpu().numpy().astype(int).tolist()
-                        y_i = y_i[:y_len[i]]
-                        true.append(model.tokenizer.decode_ids(y_i))
-
-                    all_val_pred.extend(pred)
-                    all_val_true.extend(true)
-
-                    if batch_idx % 1000 == 0 and accelerator.is_main_process:
-                        for p, t in zip(pred[:2], true[:2]):
-                            logger.info(f"Val Pred: {p}")
-                            logger.info(f"Val True: {t}")
-
-            # Gather all predictions and ground truth from all processes
-            all_val_pred = gather_object(all_val_pred, accelerator)
-            all_val_true = gather_object(all_val_true, accelerator)
-
-            # Calculate average validation loss and WER
-            val_loss /= len(val_dataloader)
-
-            if accelerator.is_main_process:
-                val_wer = wer(all_val_true, all_val_pred)
-
-                # Log validation metrics
-                accelerator.log({
-                    "val_loss": val_loss,
-                    "val_wer": val_wer,
-                    "epoch": epoch,
-                }, step=global_step)
-
-                logger.info(f"Validation - Epoch {epoch}, Loss: {val_loss:.4f}, WER: {val_wer:.4f}")
-
-                # Save checkpoint if better validation loss (matching ModelCheckpoint behavior)
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    accelerator.save_state(os.path.join(args.output_dir, f"rnnt-epoch{epoch:02d}-val_loss{val_loss:.2f}.pt"))
-                    logger.info(f"Saved new best model with val_loss: {val_loss:.4f}")
-
-        # Calculate average training loss
+        # Tính toán và ghi log train loss
         train_loss /= len(train_dataloader)
-
         if accelerator.is_main_process:
             logger.info(f"Epoch {epoch} completed in {time.time() - start_time:.2f}s")
             logger.info(f"Average Train Loss: {train_loss:.4f}")
-
-        # Save latest checkpoint (same as original StreamingRNNT on_train_epoch_end)
-        if accelerator.is_main_process:
             accelerator.save_state(os.path.join(args.output_dir, "rnnt-latest.pt"))
             logger.info(f"Saved latest model checkpoint")
 
 def get_args():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Train a StreamingRNNT model with Accelerate")
 
     # Model configuration
@@ -300,11 +192,9 @@ def get_args():
     # Data configuration
     parser.add_argument("--train_manifest", default="/kaggle/working/data/train/train_data.jsonl",
                         help="Path to training manifest file")
-    parser.add_argument("--val_manifest", default="/kaggle/working/data/test/test_data.jsonl",
-                        help="Path to validation manifest file")
-    parser.add_argument("--bg_noise_path", default="/kaggle/working/datatest/noise/fsdnoisy18k/",
-                        help="Path to background noise for augmentation")
-    parser.add_argument("--augment", action="store_true", default=True,
+    parser.add_argument("--base_path", type=str, default="/kaggle/working/",
+                        help="Base path for resolving audio file paths")
+    parser.add_argument("--augment", action="store_true", default=False,
                         help="Apply data augmentation")
 
     # Output and checkpointing
@@ -312,10 +202,6 @@ def get_args():
                         help="Output directory for logs and checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from")
-
-    # Validation configuration
-    parser.add_argument("--check_val_every_n_epoch", type=int, default=2,
-                        help="Run validation every N epochs")
 
     # Mixed precision
     parser.add_argument("--precision", type=str, default="bf16-mixed",
