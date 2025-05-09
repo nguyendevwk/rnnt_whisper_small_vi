@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import warprnnt_numba
 import sentencepiece as spm
-from loguru import logger
 
 from models.encoder import AudioEncoder
 from models.decoder import Decoder
@@ -94,7 +93,7 @@ class StreamingRNNT(nn.Module):
 
     def forward(self, x, x_len, y, y_len):
         """
-        Forward pass that computes loss. Replaces the Lightning training_step and validation_step.
+        Forward pass that computes loss
         """
         enc_out, x_len = self.encoder(x, x_len) # (B, T, Enc_dim)
 
@@ -111,5 +110,4 @@ class StreamingRNNT(nn.Module):
 
         loss = self.loss(logits.to(torch.float32), targets, input_lengths, target_lengths)
 
-        # Return the loss as is - the training script will handle the logging
         return loss
