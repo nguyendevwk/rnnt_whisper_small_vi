@@ -7,6 +7,7 @@ from accelerate import Accelerator
 from accelerate.utils import gather_object
 from accelerate.logging import get_logger
 from jiwer import wer
+import librosa
 import glob
 
 from models.streaming_rnnt import StreamingRNNT
