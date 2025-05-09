@@ -9,6 +9,7 @@ from accelerate.logging import get_logger
 from jiwer import wer
 import librosa
 import glob
+import numpy as np
 
 from models.streaming_rnnt import StreamingRNNT
 from utils.dataset import AudioDataset, collate_fn
@@ -27,7 +28,7 @@ class AudioDatasetWithBasePath(AudioDataset):
         self.base_path = base_path if base_path else ""
         logger.info(f"Using base path for audio files: {self.base_path}")
 
-        # Verify a few audio files exist
+        # Verify a few audio files exist to help diagnose issues early
         if len(self.samples) > 0:
             for i in range(min(5, len(self.samples))):
                 audio_path = self._get_audio_path(self.samples[i]['audio_filepath'])
@@ -44,12 +45,12 @@ class AudioDatasetWithBasePath(AudioDataset):
             return os.path.join(self.base_path, filepath)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-
-        # Use the correct absolute path for audio files
-        audio_path = self._get_audio_path(sample['audio_filepath'])
-
         try:
+            sample = self.samples[idx]
+
+            # Use the correct absolute path for audio files
+            audio_path = self._get_audio_path(sample['audio_filepath'])
+
             waveform, sample_rate = librosa.load(
                 audio_path,
                 sr=SAMPLE_RATE,
@@ -63,18 +64,39 @@ class AudioDatasetWithBasePath(AudioDataset):
             melspec = self.log_mel_spectrogram(waveform, N_MELS, 0, self.device)
 
             return melspec, transcript_ids
+
         except Exception as e:
-            logger.error(f"Error loading {audio_path}: {str(e)}")
-            # Return a fallback sample (better than crashing)
-            if idx > 0:
-                return self.__getitem__(idx-1)  # Try previous item
-            else:
-                # Create a dummy sample as last resort
-                dummy_waveform = torch.zeros(16000)  # 1 second of silence
-                dummy_transcript = torch.tensor([1, 2, 3])  # Some tokens
-                dummy_melspec = torch.zeros(N_MELS, 100)  # Dummy mel spectrogram
-                logger.error(f"Using dummy sample as fallback")
-                return dummy_melspec, dummy_transcript
+            # Log error and return a fallback sample instead of crashing
+            logger.error(f"Error loading sample {idx}: {str(e)}")
+
+            # Try a different sample if possible
+            if len(self.samples) > 1:
+                fallback_idx = (idx + 1) % len(self.samples)
+                if fallback_idx != idx:  # Avoid infinite recursion
+                    logger.info(f"Using fallback sample {fallback_idx}")
+                    return self.__getitem__(fallback_idx)
+
+            # Create a dummy sample as last resort
+            dummy_waveform = torch.zeros(16000)  # 1 second of silence
+            dummy_transcript = torch.tensor([1, 2, 3])  # Some tokens
+            dummy_melspec = torch.zeros(N_MELS, 100)  # Dummy mel spectrogram
+            logger.warning(f"Using dummy sample for idx {idx}")
+            return dummy_melspec, dummy_transcript
+
+# Custom collate function that skips bad samples
+def robust_collate_fn(batch):
+    # Filter out None values that might occur from failed __getitem__ calls
+    valid_batch = [item for item in batch if item is not None]
+    if len(valid_batch) == 0:
+        # Return dummy batch if all samples failed
+        dummy_melspec = torch.zeros(1, N_MELS, 100)
+        dummy_mel_lengths = torch.tensor([100], dtype=torch.int)
+        dummy_text = torch.tensor([[1, 2, 3]])
+        dummy_text_lengths = torch.tensor([3], dtype=torch.int)
+        return dummy_melspec, dummy_mel_lengths, dummy_text, dummy_text_lengths
+
+    # Use original collate function for valid samples
+    return collate_fn(valid_batch)
 
 def train(args):
     """
@@ -109,10 +131,16 @@ def train(args):
             logger.error(f"Manifest file does not exist or is not a file: {manifest}")
             raise FileNotFoundError(f"Manifest file not found: {manifest}")
 
-    # Handle background noise path
-    bg_noise_path = args.bg_noise_path if hasattr(args, 'bg_noise_path') and args.bg_noise_path else []
+    # Handle the background noise path - make sure it exists if specified
+    bg_noise_path = []
+    if args.bg_noise_path:
+        if os.path.exists(args.bg_noise_path):
+            bg_noise_path = args.bg_noise_path
+            logger.info(f"Using background noise from: {bg_noise_path}")
+        else:
+            logger.warning(f"Background noise path not found: {args.bg_noise_path}")
 
-    # Create datasets and dataloaders with the enhanced dataset class
+    # Create datasets and dataloaders
     try:
         train_dataset = AudioDatasetWithBasePath(
             base_path=args.audio_base_path,
@@ -143,7 +171,7 @@ def train(args):
         shuffle=True,
         num_workers=args.num_workers,
         persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_fn,
+        collate_fn=robust_collate_fn,
         pin_memory=True
     )
 
@@ -153,7 +181,7 @@ def train(args):
         shuffle=False,
         num_workers=args.num_workers,
         persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_fn,
+        collate_fn=robust_collate_fn,
         pin_memory=True
     )
 
@@ -200,10 +228,10 @@ def train(args):
         model.train()
         train_loss = 0.0
         start_time = time.time()
+        batch_count = 0
 
         # Training
         for batch_idx, batch in enumerate(train_dataloader):
-            # Skip problematic batches rather than crashing
             try:
                 x, x_len, y, y_len = batch
 
@@ -221,6 +249,7 @@ def train(args):
                 # Update loss
                 train_loss += loss.item()
                 global_step += 1
+                batch_count += 1
 
                 # Log training metrics (every 100 steps as in the original code)
                 if batch_idx % 100 == 0 and accelerator.is_main_process:
@@ -256,6 +285,7 @@ def train(args):
                             accelerator.log({"train_wer": train_wer}, step=global_step)
                             logger.info(f"Training WER: {train_wer:.4f}")
                         model.train()
+
             except Exception as e:
                 logger.error(f"Error in training batch {batch_idx}: {str(e)}")
                 continue
@@ -263,6 +293,14 @@ def train(args):
             # For debugging/testing - stop after a few steps if max_steps is set
             if hasattr(args, 'max_steps') and args.max_steps > 0 and global_step >= args.max_steps:
                 break
+
+        # Calculate average training loss
+        if batch_count > 0:
+            train_loss /= batch_count
+
+            if accelerator.is_main_process:
+                logger.info(f"Epoch {epoch} completed in {time.time() - start_time:.2f}s")
+                logger.info(f"Average Train Loss: {train_loss:.4f}")
 
         # Only run validation every val_check_interval epochs
         if epoch % args.val_check_interval == 0:
@@ -293,6 +331,7 @@ def train(args):
 
                         all_val_pred.extend(pred)
                         all_val_true.extend(true)
+
                     except Exception as e:
                         logger.error(f"Error in validation batch {batch_idx}: {str(e)}")
                         continue
@@ -323,18 +362,10 @@ def train(args):
                         accelerator.save_state(os.path.join(args.output_dir, f"rnnt-epoch{epoch:02d}-val_loss{val_loss:.2f}.pt"))
                         logger.info(f"Saved new best model with val_loss: {val_loss:.4f}")
 
-        # Calculate average training loss
-        if global_step > 0:
-            train_loss /= global_step
-
-            if accelerator.is_main_process:
-                logger.info(f"Epoch {epoch} completed in {time.time() - start_time:.2f}s")
-                logger.info(f"Average Train Loss: {train_loss:.4f}")
-
-            # Save latest checkpoint (same as original StreamingRNNT on_train_epoch_end)
-            if accelerator.is_main_process:
-                accelerator.save_state(os.path.join(args.output_dir, "rnnt-latest.pt"))
-                logger.info(f"Saved latest model checkpoint")
+        # Save latest checkpoint (same as original StreamingRNNT on_train_epoch_end)
+        if accelerator.is_main_process:
+            accelerator.save_state(os.path.join(args.output_dir, "rnnt-latest.pt"))
+            logger.info(f"Saved latest model checkpoint")
 
         # Stop if max_steps was reached
         if hasattr(args, 'max_steps') and args.max_steps > 0 and global_step >= args.max_steps:
@@ -354,12 +385,12 @@ def get_args():
 
     # Training configuration
     parser.add_argument("--batch_size", type=int, default=32,
-                        help="Batch size")
+                        help="Batch size per GPU")
     parser.add_argument("--max_epochs", type=int, default=10,
                         help="Maximum number of epochs")
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Maximum number of steps (0 for no limit)")
-    parser.add_argument("--num_workers", type=int, default=4,
+    parser.add_argument("--num_workers", type=int, default=2,
                         help="Number of dataloader workers")
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
