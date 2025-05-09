@@ -11,10 +11,6 @@ from jiwer import wer
 from models.streaming_rnnt import StreamingRNNT
 from utils.dataset import AudioDataset, collate_fn
 from utils.scheduler import WarmupLR
-from constants import ATTENTION_CONTEXT_SIZE, VOCAB_SIZE, TOKENIZER_MODEL_PATH
-from constants import BATCH_SIZE, NUM_WORKERS, MAX_EPOCHS
-from constants import TRAIN_MANIFEST, VAL_MANIFEST
-from constants import LOG_DIR, BG_NOISE_PATH
 from constants import TOTAL_STEPS, WARMUP_STEPS, LR, MIN_LR
 
 # Set up logger
@@ -39,28 +35,34 @@ def train(args):
     logger.info(f"Mixed precision: {accelerator.mixed_precision}")
     logger.info(f"Number of processes: {accelerator.num_processes}")
     logger.info(f"Device: {accelerator.device}")
+    logger.info(f"Train manifest: {args.train_manifest}")
+    logger.info(f"Val manifest: {args.val_manifest}")
 
     # Create datasets and dataloaders
-    train_dataset = AudioDataset(
-        manifest_files=args.train_manifest,
-        bg_noise_path=args.bg_noise_path,
-        shuffle=True,
-        augment=args.augment,
-        tokenizer_model_path=args.tokenizer_model_path
-    )
+    try:
+        train_dataset = AudioDataset(
+            manifest_files=args.train_manifest,
+            bg_noise_path=args.bg_noise_path if hasattr(args, 'bg_noise_path') else None,
+            shuffle=True,
+            augment=args.augment if hasattr(args, 'augment') else True,
+            tokenizer_model_path=args.tokenizer_model_path
+        )
 
-    val_dataset = AudioDataset(
-        manifest_files=args.val_manifest,
-        shuffle=False,
-        tokenizer_model_path=args.tokenizer_model_path
-    )
+        val_dataset = AudioDataset(
+            manifest_files=args.val_manifest,
+            shuffle=False,
+            tokenizer_model_path=args.tokenizer_model_path
+        )
+    except Exception as e:
+        logger.error(f"Error creating datasets: {e}")
+        raise
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        persistent_workers=True,
+        persistent_workers=True if args.num_workers > 0 else False,
         collate_fn=collate_fn,
         pin_memory=True
     )
@@ -70,21 +72,32 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        persistent_workers=True,
+        persistent_workers=True if args.num_workers > 0 else False,
         collate_fn=collate_fn,
         pin_memory=True
     )
 
     # Create model
+    att_context_size = args.att_context_size
+    if isinstance(att_context_size, int):
+        att_context_size = [-1, att_context_size]  # Convert single int to list format
+
+    logger.info(f"Using attention context size: {att_context_size}")
+
     model = StreamingRNNT(
-        att_context_size=args.att_context_size,
-        vocab_size=args.vocab_size,
+        att_context_size=att_context_size,
+        vocab_size=args.vocab_size if hasattr(args, 'vocab_size') else 1024,  # Default to 1024 if not specified
         tokenizer_model_path=args.tokenizer_model_path
     )
 
     # Create optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = WarmupLR(optimizer, args.warmup_steps, args.total_steps, args.min_lr)
+
+    total_steps = args.total_steps if hasattr(args, 'total_steps') else TOTAL_STEPS
+    warmup_steps = args.warmup_steps if hasattr(args, 'warmup_steps') else WARMUP_STEPS
+    min_lr = args.min_lr if hasattr(args, 'min_lr') else MIN_LR
+
+    scheduler = WarmupLR(optimizer, warmup_steps, total_steps, min_lr)
 
     # Prepare all components with accelerator
     model, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
@@ -95,7 +108,7 @@ def train(args):
     best_val_loss = float('inf')
 
     # Load checkpoint if provided
-    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
+    if hasattr(args, 'resume_from_checkpoint') and args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
         accelerator.load_state(args.resume_from_checkpoint)
         logger.info(f"Loaded checkpoint from {args.resume_from_checkpoint}")
 
@@ -163,7 +176,7 @@ def train(args):
                     model.train()
 
             # For debugging/testing - stop after a few steps if max_steps is set
-            if args.max_steps > 0 and global_step >= args.max_steps:
+            if hasattr(args, 'max_steps') and args.max_steps > 0 and global_step >= args.max_steps:
                 break
 
         # Only run validation every val_check_interval epochs
@@ -231,7 +244,7 @@ def train(args):
             logger.info(f"Saved latest model checkpoint")
 
         # Stop if max_steps was reached
-        if args.max_steps > 0 and global_step >= args.max_steps:
+        if hasattr(args, 'max_steps') and args.max_steps > 0 and global_step >= args.max_steps:
             break
 
 def get_args():
@@ -239,23 +252,23 @@ def get_args():
     parser = argparse.ArgumentParser(description="Train a StreamingRNNT model with Accelerate")
 
     # Model configuration
-    parser.add_argument("--att_context_size", type=int, default=ATTENTION_CONTEXT_SIZE,
+    parser.add_argument("--att_context_size", type=int, default=80,
                         help="Attention context size")
-    parser.add_argument("--vocab_size", type=int, default=VOCAB_SIZE,
+    parser.add_argument("--vocab_size", type=int, default=1024,
                         help="Vocabulary size")
-    parser.add_argument("--tokenizer_model_path", type=str, default=TOKENIZER_MODEL_PATH,
+    parser.add_argument("--tokenizer_model_path", type=str, required=True,
                         help="Path to tokenizer model")
 
     # Training configuration
-    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
+    parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size")
-    parser.add_argument("--max_epochs", type=int, default=MAX_EPOCHS,
+    parser.add_argument("--max_epochs", type=int, default=10,
                         help="Maximum number of epochs")
     parser.add_argument("--max_steps", type=int, default=0,
                         help="Maximum number of steps (0 for no limit)")
-    parser.add_argument("--num_workers", type=int, default=NUM_WORKERS,
+    parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of dataloader workers")
-    parser.add_argument("--lr", type=float, default=LR,
+    parser.add_argument("--lr", type=float, default=3e-4,
                         help="Learning rate")
     parser.add_argument("--warmup_steps", type=int, default=WARMUP_STEPS,
                         help="Warmup steps for scheduler")
@@ -265,27 +278,27 @@ def get_args():
                         help="Minimum learning rate")
 
     # Data configuration
-    parser.add_argument("--train_manifest", type=str, default=TRAIN_MANIFEST,
+    parser.add_argument("--train_manifest", type=str, required=True,
                         help="Path to training manifest file")
-    parser.add_argument("--val_manifest", type=str, default=VAL_MANIFEST,
+    parser.add_argument("--val_manifest", type=str, required=True,
                         help="Path to validation manifest file")
-    parser.add_argument("--bg_noise_path", type=str, default=BG_NOISE_PATH,
+    parser.add_argument("--bg_noise_path", type=str, default=None,
                         help="Path to background noise for augmentation")
-    parser.add_argument("--augment", action="store_true", default=True,
+    parser.add_argument("--augment", action="store_true", default=False,
                         help="Apply data augmentation")
 
     # Output and checkpointing
-    parser.add_argument("--output_dir", type=str, default=LOG_DIR,
+    parser.add_argument("--output_dir", type=str, default="./checkpoints",
                         help="Output directory for logs and checkpoints")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to checkpoint to resume from")
 
     # Validation configuration
-    parser.add_argument("--val_check_interval", type=int, default=2,
+    parser.add_argument("--val_check_interval", type=int, default=1,
                         help="Run validation every N epochs")
 
     # Mixed precision
-    parser.add_argument("--precision", type=str, default="bf16-mixed",
+    parser.add_argument("--precision", type=str, default="fp16",
                         choices=["no", "fp16", "bf16", "fp16-mixed", "bf16-mixed"],
                         help="Mixed precision mode")
 
