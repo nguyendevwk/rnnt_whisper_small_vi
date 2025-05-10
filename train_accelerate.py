@@ -1,185 +1,275 @@
-
-import os
 import torch
-import numpy as np
-import json
-import librosa
-import torch.nn.functional as F
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader
+
+# from warp_rnnt import rnnt_loss
+import warprnnt_numba
+
 import sentencepiece as spm
-from torch.utils.data import Dataset
-from torch.nn.utils.rnn import pad_sequence
+from jiwer import wer
+
 from loguru import logger
-from tqdm import tqdm
-from constants import SAMPLE_RATE, N_FFT, HOP_LENGTH, N_MELS, PAD
 
-class AudioDataset(Dataset):
-    def __init__(self,
-                manifest_files,
-                tokenizer_model_path,
-                base_path,  # Base path for resolving audio file paths
-                bg_noise_path=None,
-                shuffle=False,
-                augment=False,
-                max_duration=15.1,
-                min_duration=0.9,
-                min_text_len=3,
-                max_text_len=99999):
-        self.samples = []
-        throw_away = 0
-        self.base_path = base_path
+from models.encoder import AudioEncoder
+from models.decoder import Decoder
+from models.jointer import Jointer
 
-        # Log initialization info
-        logger.info(f"Initializing AudioDataset with base_path: {base_path}")
-        logger.info(f"Augmentation enabled: {augment}")
+from constants import RNNT_BLANK, PAD, VOCAB_SIZE, TOKENIZER_MODEL_PATH, MAX_SYMBOLS
+from constants import ATTENTION_CONTEXT_SIZE
+from constants import N_STATE, N_LAYER, N_HEAD, N_MELS
+from constants import BATCH_SIZE, NUM_WORKERS
+from constants import MAX_EPOCHS, TOTAL_STEPS, WARMUP_STEPS, LR, MIN_LR
+from constants import PRETRAINED_ENCODER_WEIGHT, TRAIN_MANIFEST, VAL_MANIFEST, LOG_DIR, BG_NOISE_PATH
 
-        # Process all manifest files
-        for manifest_file in manifest_files:
-            if not os.path.exists(manifest_file):
-                logger.error(f"Manifest file not found: {manifest_file}")
-                raise FileNotFoundError(f"Manifest file not found: {manifest_file}")
+from utils.dataset import AudioDataset, collate_fn
+from utils.scheduler import WarmupLR
 
-            logger.info(f"Loading manifest: {manifest_file}")
-            with open(manifest_file, 'r', encoding='utf-8') as f:
-                for line in tqdm(f, desc=f'Loading {manifest_file}'):
-                    try:
-                        sample = json.loads(line)
-                        audio_path = sample['audio_filepath']
+class StreamingRNNT(pl.LightningModule):
+    def __init__(self, att_context_size, vocab_size, tokenizer_model_path):
+        super().__init__()
 
-                        # Resolve relative paths
-                        if not os.path.isabs(audio_path):
-                            audio_path = os.path.join(self.base_path, audio_path)
+        # Lưu hyperparameters để có thể lưu và restore đúng
+        self.save_hyperparameters()
 
-                        sample['audio_filepath'] = audio_path
+        # Xác định device phù hợp
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-                        # Skip samples with missing audio files
-                        if not os.path.exists(audio_path):
-                            logger.warning(f"Audio file not found, skipping: {audio_path}")
-                            throw_away += 1
-                            continue
+        # Load pretrained encoder weights
+        encoder_state_dict = torch.load(
+            PRETRAINED_ENCODER_WEIGHT,
+            map_location=device,
+            weights_only=True
+        )
+        # Create new keys 'conv3.weight', 'conv3.bias' that copy from 'conv2.weight', 'conv2.bias' so that we don't have to initialize conv3 weights
+        encoder_state_dict['model_state_dict']['conv3.weight'] = encoder_state_dict['model_state_dict']['conv2.weight']
+        encoder_state_dict['model_state_dict']['conv3.bias'] = encoder_state_dict['model_state_dict']['conv2.bias']
 
-                        # Skip samples that don't meet criteria
-                        if (sample['duration'] > max_duration or
-                            sample['duration'] < min_duration or
-                            len(sample['text'].strip()) < min_text_len or
-                            len(sample['text'].strip()) > max_text_len):
-                            throw_away += 1
-                            continue
+        self.encoder = AudioEncoder(
+            n_mels=N_MELS,
+            n_state=N_STATE,
+            n_head=N_HEAD,
+            n_layer=N_LAYER,
+            att_context_size=att_context_size
+        )
+        self.encoder.load_state_dict(encoder_state_dict['model_state_dict'], strict=False)
 
-                        self.samples.append(sample)
-                    except Exception as e:
-                        logger.warning(f"Error processing line in manifest: {str(e)}")
-                        throw_away += 1
-                        continue
+        self.decoder = Decoder(vocab_size=vocab_size + 1)
+        self.joint = Jointer(vocab_size=vocab_size + 1)
 
-        logger.info(f"Loaded {len(self.samples)} samples, skipped {throw_away} invalid samples")
-
-        if not self.samples:
-            raise ValueError("No valid samples found in the dataset")
-
-        # Shuffle if requested
-        if shuffle:
-            np.random.shuffle(self.samples)
-
-        # Load tokenizer
         self.tokenizer = spm.SentencePieceProcessor(model_file=tokenizer_model_path)
-        self.device = 'cpu'  # Use CPU for preprocessing
 
-        # Stub augmentation for now (disabled for stability)
-        self.augmentation = lambda samples, sample_rate: samples
+        # self.loss = torchaudio.transforms.RNNTLoss(reduction="mean") # RNNTLoss has bug with logits number of elements > 2**31
+        self.loss = warprnnt_numba.RNNTLossNumba(
+            blank=RNNT_BLANK, reduction="mean",
+        )
 
-    def __len__(self):
-        """Return the number of samples in the dataset"""
-        return len(self.samples)
+        # Optimizer sẽ được cấu hình trong configure_optimizers()
+        self.learning_rate = LR
 
-    def mel_filters(self, device, n_mels):
-        """Load mel filterbank matrix for STFT to mel-spectrogram conversion"""
-        assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-        with np.load("./weights/mel_filters.npz", allow_pickle=False) as f:
-            return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+        # Lưu trữ metrics để tính trung bình
+        self.validation_step_outputs = []
 
-    def log_mel_spectrogram(self, audio, n_mels, padding, device):
-        """Compute log-mel spectrogram from audio waveform"""
-        if device is not None:
-            audio = audio.to(device)
+        # Enable auto optimization
+        self.automatic_optimization = True
 
-        if padding > 0:
-            audio = F.pad(audio, (0, padding))
 
-        # Compute STFT
-        window = torch.hann_window(N_FFT).to(audio.device)
-        stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
-        magnitudes = stft[..., :-1].abs() ** 2
+    # https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L416
+    def greedy_decoding(self, x, x_len, max_symbols=None):
+        enc_out, _ = self.encoder(x, x_len)
+        all_sentences = []
+        # greedy decoding, handle each sequence independently for easier implementation
+        for batch_idx in range(enc_out.shape[0]):
+            hypothesis = [[None, None]]  # [label, state]
+            seq_enc_out = enc_out[batch_idx, :, :].unsqueeze(0) # [1, T, D]
+            seq_ids = []
 
-        # Apply mel filterbank
-        filters = self.mel_filters(audio.device, n_mels)
-        mel_spec = filters @ magnitudes
+            for time_idx in range(seq_enc_out.shape[1]):
+                curent_seq_enc_out = seq_enc_out[:, time_idx, :].unsqueeze(1) # 1, 1, D
 
-        # Convert to log scale
-        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-        log_spec = (log_spec + 4.0) / 4.0
+                not_blank = True
+                symbols_added = 0
 
-        return log_spec
+                while not_blank and (max_symbols is None or symbols_added < max_symbols):
+                    # In the first timestep, we initialize the network with RNNT Blank
+                    # In later timesteps, we provide previous predicted label as input.
+                    if hypothesis[-1][0] is None:
+                        last_token = torch.tensor([[RNNT_BLANK]], dtype=torch.long, device=seq_enc_out.device)
+                        last_seq_h_n = None
+                    else:
+                        last_token = hypothesis[-1][0]
+                        last_seq_h_n = hypothesis[-1][1]
 
-    def __getitem__(self, idx):
-        """Get sample at index idx"""
-        # Implement fallback mechanism for error cases
-        try:
-            sample = self.samples[idx]
-            audio_path = sample['audio_filepath']
+                    if last_seq_h_n is None:
+                        current_seq_dec_out, current_seq_h_n = self.decoder(last_token)
+                    else:
+                        current_seq_dec_out, current_seq_h_n = self.decoder(last_token, last_seq_h_n)
+                    logits = self.joint(curent_seq_enc_out, current_seq_dec_out)[0, 0, 0, :]  # (B, T=1, U=1, V + 1)
 
-            # Load audio
-            waveform, sample_rate = librosa.load(
-                audio_path,
-                sr=SAMPLE_RATE,
-                offset=sample['offset'],
-                duration=sample['duration']
-            )
+                    del current_seq_dec_out
 
-            # Apply augmentation
-            waveform = self.augmentation(waveform, sample_rate)
+                    _, token_id = logits.max(0)
+                    token_id = token_id.detach().item()  # K is the label at timestep t_s in inner loop, s >= 0.
 
-            # Tokenize text
-            transcript_ids = self.tokenizer.encode_as_ids(sample['text'])
+                    del logits
 
-            # Convert to tensors
-            waveform = torch.from_numpy(waveform)
-            transcript_ids = torch.tensor(transcript_ids)
+                    if token_id == RNNT_BLANK:
+                        not_blank = False
+                    else:
+                        symbols_added += 1
+                        hypothesis.append([
+                            torch.tensor([[token_id]], dtype=torch.long, device=curent_seq_enc_out.device),
+                            current_seq_h_n
+                        ])
+                        seq_ids.append(token_id)
+            all_sentences.append(self.tokenizer.decode(seq_ids))
+        return all_sentences
 
-            # Compute mel spectrogram
-            melspec = self.log_mel_spectrogram(waveform, N_MELS, 0, self.device)
+    def process_batch(self, batch):
+        return batch
 
-            return melspec, transcript_ids
+    def training_step(self, batch, batch_idx):
+        x, x_len, y, y_len = self.process_batch(batch)
 
-        except Exception as e:
-            logger.warning(f"Error loading sample {idx}: {str(e)}. Trying fallback.")
-            # Try a different sample
-            alt_idx = (idx + 1) % len(self.samples)
-            if alt_idx != idx:  # Avoid infinite recursion
-                return self.__getitem__(alt_idx)
-            else:
-                # Create a dummy sample as last resort
-                logger.error(f"All fallbacks failed. Creating dummy sample.")
-                dummy_melspec = torch.zeros(N_MELS, 100)
-                dummy_transcript = torch.tensor([1, 2, 3])
-                return dummy_melspec, dummy_transcript
+        global_rank = self.global_rank if hasattr(self, 'global_rank') else 0
+        global_step = self.global_step if hasattr(self, 'global_step') else 0
 
-def collate_fn(batch):
-    """Collate function for DataLoader"""
-    # Unzip the batch
-    mel, text_ids = zip(*batch)
+        # Chỉ đánh giá WER trên rank 0 để tiết kiệm tài nguyên
+        if global_rank == 0 and batch_idx != 0 and batch_idx % 2000 == 0:
+            # Chuyển sang eval mode để tránh dropout, etc.
+            self.encoder.eval()
+            self.decoder.eval()
+            self.joint.eval()
 
-    # Calculate maximum mel length
-    max_len = max(x.shape[-1] for x in mel)
+            with torch.no_grad():
+                all_pred = self.greedy_decoding(x, x_len, max_symbols=3)
+                all_true = []
+                for i, y_i in enumerate(y):
+                    y_i = y_i.cpu().numpy().astype(int).tolist()
+                    y_i = y_i[:y_len[i]]
+                    all_true.append(self.tokenizer.decode_ids(y_i))
 
-    # Calculate lengths
-    mel_input_lengths = torch.tensor([x.shape[-1] for x in mel])
-    text_input_lengths = torch.tensor([len(x) for x in text_ids])
+                for pred, true in zip(all_pred, all_true):
+                    logger.debug(f"Pred: {pred}")
+                    logger.debug(f"True: {true}")
 
-    # Pad mels to the same length
-    mel_padded = [torch.nn.functional.pad(x, (0, max_len - x.shape[-1])) for x in mel]
+                all_wer = wer(all_true, all_pred)
+                self.log("train_wer", all_wer, prog_bar=False, on_step=True, on_epoch=False, sync_dist=True)
 
-    # Pad text_ids to the same length
-    text_ids_padded = pad_sequence(text_ids, batch_first=True, padding_value=PAD)
+            # Trở lại train mode
+            self.encoder.train()
+            self.decoder.train()
+            self.joint.train()
 
-    # Stack and return
-    return torch.stack(mel_padded), mel_input_lengths.int(), text_ids_padded, text_input_lengths.int()
+        # Forward pass để tính loss
+        enc_out, x_len = self.encoder(x, x_len) # (B, T, Enc_dim)
+
+        # Add a blank token to the beginning of the target sequence
+        # https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/asr/parts/submodules/rnnt_greedy_decoding.py#L185
+        # Blank is also the start of sequence token and the sentence will start with blank; https://github.com/pytorch/audio/issues/3750
+        y_start = torch.cat([torch.full((y.shape[0], 1), RNNT_BLANK, dtype=torch.int).to(y.device), y], dim=1).to(y.device)
+        dec_out, _ = self.decoder(y_start) # (B, U, Dec_dim)
+        logits = self.joint(enc_out, dec_out)
+
+        input_lengths = x_len.int()
+        target_lengths = y_len.int()
+        targets = y.int()
+
+        loss = self.loss(logits.to(torch.float32), targets, input_lengths, target_lengths)
+
+        # Log mỗi 100 steps và khi trên rank 0
+        if batch_idx % 100 == 0:
+            # Log training loss với format chỉ hai chữ số cuối cùng
+            self.log("train_loss", loss.detach().item(), prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+            # Log current learning rate
+            self.log("lr", self.optimizer.param_groups[0]['lr'], on_step=True, on_epoch=False, sync_dist=True)
+
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, x_len, y, y_len = self.process_batch(batch)
+
+        # Chỉ tính WER trên một phần nhỏ của validation set để tiết kiệm thời gian
+        if batch_idx < 20:  # Giới hạn số lượng batches để đánh giá WER
+            all_pred = self.greedy_decoding(x, x_len, max_symbols=3)
+            all_true = []
+            for i, y_i in enumerate(y):
+                y_i = y_i.cpu().numpy().astype(int).tolist()
+                y_i = y_i[:y_len[i]]
+                all_true.append(self.tokenizer.decode_ids(y_i))
+
+            all_wer = wer(all_true, all_pred)
+
+            # In một số mẫu để debugging
+            if batch_idx % 10 == 0 and self.global_rank == 0:
+                for pred, true in zip(all_pred[:2], all_true[:2]):  # Chỉ in 2 mẫu đầu tiên
+                    logger.debug(f"Pred: {pred}")
+                    logger.debug(f"True: {true}")
+
+            # Thêm WER vào outputs để tính trung bình
+            self.validation_step_outputs.append({'wer': all_wer, 'count': len(all_true)})
+
+        # ------------------CALCULATE LOSS------------------
+        enc_out, x_len = self.encoder(x, x_len) # (B, T, Enc_dim)
+
+        # Add a blank token to the beginning of the target sequence
+        y_start = torch.cat([torch.full((y.shape[0], 1), RNNT_BLANK, dtype=torch.int).to(y.device), y], dim=1).to(y.device)
+        dec_out, _ = self.decoder(y_start) # (B, U, Dec_dim)
+        logits = self.joint(enc_out, dec_out)
+
+        input_lengths = x_len.int()
+        target_lengths = y_len.int()
+        targets = y.int()
+
+        loss = self.loss(logits.to(torch.float32), targets, input_lengths, target_lengths)
+        # ---------------------------------------------------
+
+        # Log loss sau mỗi batch
+        self.log("val_loss", loss.item(), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+
+        return loss
+
+    def on_validation_epoch_end(self):
+        # Tính toán WER trung bình
+        if len(self.validation_step_outputs) > 0:
+            total_wer = 0
+            total_count = 0
+
+            for output in self.validation_step_outputs:
+                total_wer += output['wer'] * output['count']
+                total_count += output['count']
+
+            avg_wer = total_wer / total_count if total_count > 0 else 0
+
+            # Log WER trung bình
+            self.log("val_wer", avg_wer, prog_bar=True, sync_dist=True)
+
+        # Reset validation outputs
+        self.validation_step_outputs = []
+
+    def on_train_epoch_end(self):
+        # Lưu checkpoint sau mỗi epoch
+        if self.trainer.is_global_zero:  # Chỉ lưu từ rank 0
+            self.trainer.save_checkpoint(f"{LOG_DIR}/rnnt-latest.ckpt", weights_only=True)
+        return super().on_train_epoch_end()
+
+    def configure_optimizers(self):
+        # Khởi tạo optimizer
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            betas=(0.9, 0.98),
+            eps=1e-9,
+            weight_decay=1e-2  # Thêm weight decay để giảm overfitting
+        )
+
+        # Khởi tạo scheduler
+        scheduler = WarmupLR(self.optimizer, WARMUP_STEPS, TOTAL_STEPS, MIN_LR)
+
+        return {
+            "optimizer": self.optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
+            }
+        }
