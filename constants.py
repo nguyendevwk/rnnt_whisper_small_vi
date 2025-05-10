@@ -1,3 +1,4 @@
+# constran.py
 # Audio parameters (FIXED)
 SAMPLE_RATE = 16000
 N_FFT = 400
@@ -35,7 +36,7 @@ MAX_SYMBOLS = 3
 # Whisper-small parameters
 N_STATE = 768
 N_HEAD = 12
-# N_LAYER = 12
+N_LAYER = 12
 
 
 # ==============================================================================

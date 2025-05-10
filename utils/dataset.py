@@ -155,6 +155,7 @@
 #     # text_ids have shape [T]
 #     text_ids_padded = pad_sequence(text_ids, batch_first=True, padding_value=PAD)
 #     return torch.stack(mel_padded), mel_input_lengths.int(), text_ids_padded, text_input_lengths.int()
+
 import os
 import torch
 import numpy as np

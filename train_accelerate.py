@@ -1,376 +1,185 @@
+
 import os
 import torch
-import time
-import argparse
-from torch.utils.data import DataLoader
-from accelerate import Accelerator
-from accelerate.utils import gather_object
-from accelerate.logging import get_logger
-from jiwer import wer
+import numpy as np
+import json
+import librosa
+import torch.nn.functional as F
+import sentencepiece as spm
+from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 from loguru import logger
+from tqdm import tqdm
+from constants import SAMPLE_RATE, N_FFT, HOP_LENGTH, N_MELS, PAD
 
-from models.streaming_rnnt import StreamingRNNT
-from utils.dataset import AudioDataset, collate_fn
-from utils.scheduler import WarmupLR
-from constants import (
-    ATTENTION_CONTEXT_SIZE, VOCAB_SIZE, TOKENIZER_MODEL_PATH,
-    BATCH_SIZE, NUM_WORKERS, MAX_EPOCHS, MAX_SYMBOLS,
-    TOTAL_STEPS, WARMUP_STEPS, LR, MIN_LR,
-    LOG_DIR
-)
+class AudioDataset(Dataset):
+    def __init__(self,
+                manifest_files,
+                tokenizer_model_path,
+                base_path,  # Base path for resolving audio file paths
+                bg_noise_path=None,
+                shuffle=False,
+                augment=False,
+                max_duration=15.1,
+                min_duration=0.9,
+                min_text_len=3,
+                max_text_len=99999):
+        self.samples = []
+        throw_away = 0
+        self.base_path = base_path
 
-def train(args):
-    """
-    Main training function using Accelerate for multi-GPU training
-    """
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+        # Log initialization info
+        logger.info(f"Initializing AudioDataset with base_path: {base_path}")
+        logger.info(f"Augmentation enabled: {augment}")
 
-    # Initialize accelerator for distributed training
-    accelerator = Accelerator(
-        mixed_precision=args.precision,
-        log_with="tensorboard",
-        project_dir=args.output_dir
-    )
+        # Process all manifest files
+        for manifest_file in manifest_files:
+            if not os.path.exists(manifest_file):
+                logger.error(f"Manifest file not found: {manifest_file}")
+                raise FileNotFoundError(f"Manifest file not found: {manifest_file}")
 
-    # Log system information
-    logger.info(f"Starting training with Accelerate")
-    logger.info(f"Distributed type: {accelerator.distributed_type}")
-    logger.info(f"Mixed precision: {accelerator.mixed_precision}")
-    logger.info(f"Number of processes: {accelerator.num_processes}")
-    logger.info(f"Device: {accelerator.device}")
-    logger.info(f"Base path: {args.base_path}")
+            logger.info(f"Loading manifest: {manifest_file}")
+            with open(manifest_file, 'r', encoding='utf-8') as f:
+                for line in tqdm(f, desc=f'Loading {manifest_file}'):
+                    try:
+                        sample = json.loads(line)
+                        audio_path = sample['audio_filepath']
 
-    # Convert manifest paths to lists if they're strings
-    train_manifest = args.train_manifest
-    if isinstance(train_manifest, str):
-        train_manifest = [train_manifest]
+                        # Resolve relative paths
+                        if not os.path.isabs(audio_path):
+                            audio_path = os.path.join(self.base_path, audio_path)
 
-    val_manifest = args.val_manifest
-    if isinstance(val_manifest, str):
-        val_manifest = [val_manifest]
+                        sample['audio_filepath'] = audio_path
 
-    logger.info(f"Train manifest: {train_manifest}")
-    logger.info(f"Val manifest: {val_manifest}")
+                        # Skip samples with missing audio files
+                        if not os.path.exists(audio_path):
+                            logger.warning(f"Audio file not found, skipping: {audio_path}")
+                            throw_away += 1
+                            continue
 
-    # Verify both manifest files exist (QUAN TRỌNG)
-    for manifest_path in train_manifest:
-        if not os.path.exists(manifest_path):
-            logger.error(f"TRAIN manifest file not found: {manifest_path}")
-            # Log directory contents to help diagnose issues
-            if accelerator.is_main_process:
-                logger.error(f"Current directory: {os.getcwd()}")
-                logger.error(f"Directory contents: {os.listdir('.')}")
-                # Try to find similar files
-                for root, dirs, files in os.walk('.', topdown=True, followlinks=False, maxdepth=3):
-                    jsonl_files = [f for f in files if f.endswith('.jsonl')]
-                    if jsonl_files:
-                        logger.error(f"Found .jsonl files in: {root}: {jsonl_files}")
-            raise FileNotFoundError(f"TRAIN manifest file not found: {manifest_path}")
+                        # Skip samples that don't meet criteria
+                        if (sample['duration'] > max_duration or
+                            sample['duration'] < min_duration or
+                            len(sample['text'].strip()) < min_text_len or
+                            len(sample['text'].strip()) > max_text_len):
+                            throw_away += 1
+                            continue
 
-    for manifest_path in val_manifest:
-        if not os.path.exists(manifest_path):
-            logger.error(f"VAL manifest file not found: {manifest_path}")
-            # Log directory contents to help diagnose issues
-            if accelerator.is_main_process:
-                logger.error(f"Current directory: {os.getcwd()}")
-                logger.error(f"Directory contents: {os.listdir('.')}")
-                # Try to find similar files
-                for root, dirs, files in os.walk('.', topdown=True, followlinks=False, maxdepth=3):
-                    jsonl_files = [f for f in files if f.endswith('.jsonl')]
-                    if jsonl_files:
-                        logger.error(f"Found .jsonl files in: {root}: {jsonl_files}")
-            raise FileNotFoundError(f"VAL manifest file not found: {manifest_path}")
+                        self.samples.append(sample)
+                    except Exception as e:
+                        logger.warning(f"Error processing line in manifest: {str(e)}")
+                        throw_away += 1
+                        continue
 
-    # Create train dataset
-    try:
-        train_dataset = AudioDataset(
-            manifest_files=train_manifest,
-            tokenizer_model_path=args.tokenizer_model_path,
-            base_path=args.base_path,
-            bg_noise_path=None,  # Disable background noise for stability
-            shuffle=True,
-            augment=args.augment
-        )
-        logger.info(f"Train dataset size: {len(train_dataset)}")
+        logger.info(f"Loaded {len(self.samples)} samples, skipped {throw_away} invalid samples")
 
-        # Create validation dataset
-        val_dataset = AudioDataset(
-            manifest_files=val_manifest,
-            tokenizer_model_path=args.tokenizer_model_path,
-            base_path=args.base_path,
-            shuffle=False,
-            augment=False  # No augmentation for validation
-        )
-        logger.info(f"Validation dataset size: {len(val_dataset)}")
+        if not self.samples:
+            raise ValueError("No valid samples found in the dataset")
 
-        # Validate a few samples to ensure paths are correct
-        if accelerator.is_main_process:
-            for i in range(min(2, len(train_dataset))):
-                sample = train_dataset.samples[i]
-                logger.info(f"Train sample {i} path: {sample['audio_filepath']}")
-                logger.info(f"Train sample {i} text: {sample['text']}")
+        # Shuffle if requested
+        if shuffle:
+            np.random.shuffle(self.samples)
 
-            for i in range(min(2, len(val_dataset))):
-                sample = val_dataset.samples[i]
-                logger.info(f"Val sample {i} path: {sample['audio_filepath']}")
-                logger.info(f"Val sample {i} text: {sample['text']}")
+        # Load tokenizer
+        self.tokenizer = spm.SentencePieceProcessor(model_file=tokenizer_model_path)
+        self.device = 'cpu'  # Use CPU for preprocessing
 
-    except Exception as e:
-        logger.error(f"Error creating datasets: {str(e)}")
-        raise
+        # Stub augmentation for now (disabled for stability)
+        self.augmentation = lambda samples, sample_rate: samples
 
-    # Create dataloaders
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    def __len__(self):
+        """Return the number of samples in the dataset"""
+        return len(self.samples)
 
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True if args.num_workers > 0 else False,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    def mel_filters(self, device, n_mels):
+        """Load mel filterbank matrix for STFT to mel-spectrogram conversion"""
+        assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
+        with np.load("./weights/mel_filters.npz", allow_pickle=False) as f:
+            return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
 
-    # Create model
-    attention_context_size = args.att_context_size
-    if isinstance(attention_context_size, int):
-        attention_context_size = [-1, attention_context_size]
+    def log_mel_spectrogram(self, audio, n_mels, padding, device):
+        """Compute log-mel spectrogram from audio waveform"""
+        if device is not None:
+            audio = audio.to(device)
 
-    logger.info(f"Using attention context size: {attention_context_size}")
-    model = StreamingRNNT(
-        att_context_size=attention_context_size,
-        vocab_size=args.vocab_size,
-        tokenizer_model_path=args.tokenizer_model_path
-    )
+        if padding > 0:
+            audio = F.pad(audio, (0, padding))
 
-    # Create optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
-    scheduler = WarmupLR(optimizer, args.warmup_steps, args.total_steps, args.min_lr)
+        # Compute STFT
+        window = torch.hann_window(N_FFT).to(audio.device)
+        stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
+        magnitudes = stft[..., :-1].abs() ** 2
 
-    # Prepare for distributed training
-    model, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, scheduler
-    )
+        # Apply mel filterbank
+        filters = self.mel_filters(audio.device, n_mels)
+        mel_spec = filters @ magnitudes
 
-    # Initialize trackers
-    global_step = 0
-    best_val_loss = float('inf')
+        # Convert to log scale
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = (log_spec + 4.0) / 4.0
 
-    # Load checkpoint if provided
-    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
-        accelerator.load_state(args.resume_from_checkpoint)
-        logger.info(f"Loaded checkpoint from {args.resume_from_checkpoint}")
+        return log_spec
 
-    # Training loop
-    for epoch in range(args.max_epochs):
-        model.train()
-        train_loss = 0.0
-        start_time = time.time()
-        epoch_steps = 0
+    def __getitem__(self, idx):
+        """Get sample at index idx"""
+        # Implement fallback mechanism for error cases
+        try:
+            sample = self.samples[idx]
+            audio_path = sample['audio_filepath']
 
-        # Train epoch
-        logger.info(f"Starting epoch {epoch}")
-        for batch_idx, batch in enumerate(train_dataloader):
-            try:
-                # Process batch and compute loss
-                x, x_len, y, y_len = model.process_batch(batch)
-                loss = model(x, x_len, y, y_len)
+            # Load audio
+            waveform, sample_rate = librosa.load(
+                audio_path,
+                sr=SAMPLE_RATE,
+                offset=sample['offset'],
+                duration=sample['duration']
+            )
 
-                # Backward pass and optimization
-                accelerator.backward(loss)
+            # Apply augmentation
+            waveform = self.augmentation(waveform, sample_rate)
 
-                # Gradient clipping
-                if args.grad_clip > 0:
-                    accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # Tokenize text
+            transcript_ids = self.tokenizer.encode_as_ids(sample['text'])
 
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+            # Convert to tensors
+            waveform = torch.from_numpy(waveform)
+            transcript_ids = torch.tensor(transcript_ids)
 
-                # Update metrics
-                train_loss += loss.item()
-                global_step += 1
-                epoch_steps += 1
+            # Compute mel spectrogram
+            melspec = self.log_mel_spectrogram(waveform, N_MELS, 0, self.device)
 
-                # Log training metrics periodically
-                if batch_idx % 100 == 0:
-                    lr = optimizer.param_groups[0]['lr']
-                    accelerator.log({
-                        "train_loss": loss.item(),
-                        "learning_rate": lr,
-                    }, step=global_step)
-                    logger.info(f"Epoch {epoch}, Step {global_step}, Batch {batch_idx}, Loss: {loss.item():.4f}, LR: {lr:.8f}")
+            return melspec, transcript_ids
 
-                # Evaluate predictions periodically
-                if batch_idx != 0 and batch_idx % 2000 == 0:
-                    with torch.no_grad():
-                        model.eval()
-                        all_pred = model.greedy_decoding(x, x_len, max_symbols=MAX_SYMBOLS)
-                        all_true = []
-                        for i, y_i in enumerate(y):
-                            y_i = y_i.cpu().numpy().astype(int).tolist()
-                            y_i = y_i[:y_len[i]]
-                            all_true.append(model.tokenizer.decode_ids(y_i))
+        except Exception as e:
+            logger.warning(f"Error loading sample {idx}: {str(e)}. Trying fallback.")
+            # Try a different sample
+            alt_idx = (idx + 1) % len(self.samples)
+            if alt_idx != idx:  # Avoid infinite recursion
+                return self.__getitem__(alt_idx)
+            else:
+                # Create a dummy sample as last resort
+                logger.error(f"All fallbacks failed. Creating dummy sample.")
+                dummy_melspec = torch.zeros(N_MELS, 100)
+                dummy_transcript = torch.tensor([1, 2, 3])
+                return dummy_melspec, dummy_transcript
 
-                        # Gather predictions from all processes for accurate WER calculation
-                        all_pred = gather_object(all_pred, accelerator)
-                        all_true = gather_object(all_true, accelerator)
+def collate_fn(batch):
+    """Collate function for DataLoader"""
+    # Unzip the batch
+    mel, text_ids = zip(*batch)
 
-                        # Log examples and WER
-                        if accelerator.is_main_process:
-                            for pred, true in zip(all_pred[:2], all_true[:2]):
-                                logger.info(f"Pred: {pred}")
-                                logger.info(f"True: {true}")
+    # Calculate maximum mel length
+    max_len = max(x.shape[-1] for x in mel)
 
-                            train_wer = wer(all_true, all_pred)
-                            accelerator.log({"train_wer": train_wer}, step=global_step)
-                            logger.info(f"Training WER: {train_wer:.4f}")
+    # Calculate lengths
+    mel_input_lengths = torch.tensor([x.shape[-1] for x in mel])
+    text_input_lengths = torch.tensor([len(x) for x in text_ids])
 
-                        model.train()
+    # Pad mels to the same length
+    mel_padded = [torch.nn.functional.pad(x, (0, max_len - x.shape[-1])) for x in mel]
 
-            except Exception as e:
-                logger.warning(f"Error processing batch {batch_idx}: {str(e)}. Skipping.")
-                continue
+    # Pad text_ids to the same length
+    text_ids_padded = pad_sequence(text_ids, batch_first=True, padding_value=PAD)
 
-        # Run validation after each epoch
-        model.eval()
-        val_loss = 0.0
-        val_steps = 0
-        all_val_pred = []
-        all_val_true = []
-
-        logger.info(f"Running validation for epoch {epoch}")
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(val_dataloader):
-                try:
-                    # Process batch
-                    x, x_len, y, y_len = model.process_batch(batch)
-
-                    # Compute loss
-                    loss = model(x, x_len, y, y_len)
-                    val_loss += loss.item()
-                    val_steps += 1
-
-                    # Decode predictions
-                    pred = model.greedy_decoding(x, x_len, max_symbols=MAX_SYMBOLS)
-                    true = []
-                    for i, y_i in enumerate(y):
-                        y_i = y_i.cpu().numpy().astype(int).tolist()
-                        y_i = y_i[:y_len[i]]
-                        true.append(model.tokenizer.decode_ids(y_i))
-
-                    all_val_pred.extend(pred)
-                    all_val_true.extend(true)
-
-                    # Log examples
-                    if batch_idx % 100 == 0 and accelerator.is_main_process:
-                        logger.info(f"Val batch {batch_idx}, Loss: {loss.item():.4f}")
-
-                except Exception as e:
-                    logger.warning(f"Error in validation batch {batch_idx}: {str(e)}. Skipping.")
-                    continue
-
-        # Gather validation results from all processes
-        all_val_pred = gather_object(all_val_pred, accelerator)
-        all_val_true = gather_object(all_val_true, accelerator)
-
-        # Compute validation metrics
-        if val_steps > 0:
-            val_loss /= val_steps
-
-            if accelerator.is_main_process and len(all_val_true) > 0:
-                val_wer = wer(all_val_true, all_val_pred)
-
-                # Log validation metrics
-                accelerator.log({
-                    "val_loss": val_loss,
-                    "val_wer": val_wer,
-                    "epoch": epoch,
-                }, step=global_step)
-
-                logger.info(f"Validation - Epoch {epoch}, Loss: {val_loss:.4f}, WER: {val_wer:.4f}")
-
-                # Save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    accelerator.save_state(os.path.join(args.output_dir, f"rnnt-best-val_loss{val_loss:.2f}.pt"))
-                    logger.info(f"New best validation loss: {val_loss:.4f}")
-
-        # Compute average training loss
-        if epoch_steps > 0:
-            train_loss /= epoch_steps
-            if accelerator.is_main_process:
-                logger.info(f"Epoch {epoch} completed in {time.time() - start_time:.2f}s")
-                logger.info(f"Average Train Loss: {train_loss:.4f}")
-
-                # Save epoch checkpoint
-                accelerator.save_state(os.path.join(args.output_dir, f"rnnt-epoch{epoch:02d}.pt"))
-                accelerator.save_state(os.path.join(args.output_dir, "rnnt-latest.pt"))
-                logger.info(f"Saved model checkpoint for epoch {epoch}")
-
-def get_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Train a StreamingRNNT model with Accelerate")
-
-    # Model configuration
-    parser.add_argument("--att_context_size", default=ATTENTION_CONTEXT_SIZE,
-                      help="Attention context size")
-    parser.add_argument("--vocab_size", type=int, default=VOCAB_SIZE,
-                      help="Vocabulary size")
-    parser.add_argument("--tokenizer_model_path", type=str, default=TOKENIZER_MODEL_PATH,
-                      help="Path to tokenizer model")
-
-    # Training configuration
-    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE,
-                      help="Batch size")
-    parser.add_argument("--max_epochs", type=int, default=MAX_EPOCHS,
-                      help="Maximum number of epochs")
-    parser.add_argument("--num_workers", type=int, default=NUM_WORKERS,
-                      help="Number of dataloader workers")
-    parser.add_argument("--lr", type=float, default=LR,
-                      help="Learning rate")
-    parser.add_argument("--warmup_steps", type=int, default=WARMUP_STEPS,
-                      help="Warmup steps for scheduler")
-    parser.add_argument("--total_steps", type=int, default=TOTAL_STEPS,
-                      help="Total steps for scheduler")
-    parser.add_argument("--min_lr", type=float, default=MIN_LR,
-                      help="Minimum learning rate")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                      help="Gradient clipping value")
-
-    # Data configuration - QUAN TRỌNG: Cần cả 2 đường dẫn
-    parser.add_argument("--train_manifest", default="/kaggle/working/data/train/train_data.jsonl",
-                      help="Path to training manifest file (REQUIRED)")
-    parser.add_argument("--val_manifest", default="/kaggle/working/data/test/test_data.jsonl",
-                      help="Path to validation manifest file (REQUIRED)")
-    parser.add_argument("--base_path", type=str, default="/kaggle/working/",
-                      help="Base path for resolving audio file paths")
-    parser.add_argument("--augment", action="store_true", default=False,
-                      help="Apply data augmentation")
-
-    # Output and checkpointing
-    parser.add_argument("--output_dir", type=str, default=LOG_DIR,
-                      help="Output directory for logs and checkpoints")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                      help="Path to checkpoint to resume from")
-
-    # Mixed precision
-    parser.add_argument("--precision", type=str, default="bf16-mixed",
-                     choices=["no", "fp16", "bf16", "fp16-mixed", "bf16-mixed"],
-                     help="Mixed precision mode")
-
-    return parser.parse_args()
-
-if __name__ == "__main__":
-    args = get_args()
-    train(args)
+    # Stack and return
+    return torch.stack(mel_padded), mel_input_lengths.int(), text_ids_padded, text_input_lengths.int()
