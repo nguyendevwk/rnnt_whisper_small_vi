@@ -33,7 +33,7 @@ class AudioDataset(Dataset):
         self.samples = []
         throw_away = 0
         for manifest_file in manifest_files:
-            with open(manifest_file, 'r',  encoding='utf-8') as f:
+            with open(manifest_file, 'r') as f:
                 for line in tqdm(f, desc=f'Loading {manifest_file}'):
                     sample = json.loads(line)
                     if  sample['duration'] > max_duration or sample['duration'] < min_duration or \
